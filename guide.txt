@@ -1,0 +1,907 @@
+# BookTalk - Complete Implementation
+
+## File Tree Structure
+```
+booktalk/
+├── app/
+│   ├── api/
+│   │   ├── upload/
+│   │   │   └── route.ts
+│   │   └── ask/
+│   │       └── route.ts
+│   ├── globals.css
+│   ├── layout.tsx
+│   └── page.tsx
+├── lib/
+│   ├── openai.ts
+│   ├── supabase.ts
+│   └── utils.ts
+├── types/
+│   └── index.ts
+├── package.json
+├── tsconfig.json
+├── tailwind.config.ts
+├── next.config.mjs
+├── .env.example
+└── README.md
+```
+
+## 1. Package.json
+```json
+{
+  "name": "booktalk",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.3",
+    "epub-parser": "^0.2.5",
+    "next": "14.2.3",
+    "openai": "^4.28.0",
+    "pdf-parse": "^1.1.1",
+    "react": "^18",
+    "react-dom": "^18",
+    "react-dropzone": "^14.2.3",
+    "react-markdown": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "autoprefixer": "^10.0.1",
+    "eslint": "^8",
+    "eslint-config-next": "14.2.3",
+    "postcss": "^8",
+    "tailwindcss": "^3.3.0",
+    "typescript": "^5"
+  }
+}
+```
+
+## 2. Environment Variables (.env.example)
+```env
+OPENAI_API_KEY=sk-your-openai-api-key
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+```
+
+## 3. Types (types/index.ts)
+```typescript
+export interface Chunk {
+  id?: string;
+  content: string;
+  page_number: number;
+  chunk_index: number;
+  document_id: string;
+  embedding?: number[];
+}
+
+export interface Document {
+  id: string;
+  filename: string;
+  uploaded_at: string;
+  total_pages: number;
+  total_chunks: number;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  citations?: Citation[];
+}
+
+export interface Citation {
+  page: number;
+  text: string;
+}
+```
+
+## 4. Supabase Configuration (lib/supabase.ts)
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing Supabase environment variables');
+}
+
+export const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      persistSession: false
+    }
+  }
+);
+
+// SQL Schema for Supabase
+export const supabaseSchema = `
+-- Enable the pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Create documents table
+CREATE TABLE IF NOT EXISTS documents (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  filename TEXT NOT NULL,
+  uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  total_pages INTEGER NOT NULL,
+  total_chunks INTEGER NOT NULL
+);
+
+-- Create chunks table with vector embedding
+CREATE TABLE IF NOT EXISTS chunks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  page_number INTEGER NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  embedding vector(1536), -- OpenAI text-embedding-3-small dimension
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create index for vector similarity search
+CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks 
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- Create a function for semantic search
+CREATE OR REPLACE FUNCTION search_chunks(
+  query_embedding vector(1536),
+  match_count int DEFAULT 5,
+  filter_document_id UUID DEFAULT NULL
+)
+RETURNS TABLE (
+  id UUID,
+  document_id UUID,
+  content TEXT,
+  page_number INTEGER,
+  chunk_index INTEGER,
+  similarity FLOAT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    c.id,
+    c.document_id,
+    c.content,
+    c.page_number,
+    c.chunk_index,
+    1 - (c.embedding <=> query_embedding) AS similarity
+  FROM chunks c
+  WHERE (filter_document_id IS NULL OR c.document_id = filter_document_id)
+  ORDER BY c.embedding <=> query_embedding
+  LIMIT match_count;
+END;
+$$;
+`;
+```
+
+## 5. OpenAI Configuration (lib/openai.ts)
+```typescript
+import OpenAI from 'openai';
+
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error('Missing OPENAI_API_KEY environment variable');
+}
+
+export const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+```
+
+## 6. Utility Functions (lib/utils.ts)
+```typescript
+// Token estimation (rough approximation)
+export function estimateTokens(text: string): number {
+  // Rough estimation: 1 token ≈ 4 characters
+  return Math.ceil(text.length / 4);
+}
+
+// Text chunking with overlap
+export function chunkText(
+  text: string,
+  maxTokens: number = 800,
+  overlap: number = 100
+): string[] {
+  const chunks: string[] = [];
+  const words = text.split(/\s+/);
+  let currentChunk: string[] = [];
+  let currentTokens = 0;
+
+  for (const word of words) {
+    const wordTokens = estimateTokens(word);
+    
+    if (currentTokens + wordTokens > maxTokens && currentChunk.length > 0) {
+      chunks.push(currentChunk.join(' '));
+      
+      // Keep the last few words for overlap
+      const overlapWords = [];
+      let overlapTokens = 0;
+      
+      for (let i = currentChunk.length - 1; i >= 0 && overlapTokens < overlap; i--) {
+        const token = currentChunk[i];
+        overlapTokens += estimateTokens(token);
+        overlapWords.unshift(token);
+      }
+      
+      currentChunk = overlapWords;
+      currentTokens = overlapTokens;
+    }
+    
+    currentChunk.push(word);
+    currentTokens += wordTokens;
+  }
+  
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk.join(' '));
+  }
+  
+  return chunks;
+}
+
+// Generate a unique document ID
+export function generateDocumentId(): string {
+  return `doc_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+```
+
+## 7. Upload API Route (app/api/upload/route.ts)
+```typescript
+import { NextRequest, NextResponse } from 'next/server';
+import pdf from 'pdf-parse';
+import { supabase } from '@/lib/supabase';
+import { openai } from '@/lib/openai';
+import { chunkText, generateDocumentId } from '@/lib/utils';
+import type { Chunk, Document } from '@/types';
+
+export async function POST(request: NextRequest) {
+  try {
+    const formData = await request.formData();
+    const file = formData.get('file') as File;
+    
+    if (!file) {
+      return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+    }
+
+    // Convert file to buffer
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
+
+    // Extract text based on file type
+    let text = '';
+    let pageTexts: string[] = [];
+    
+    if (file.name.toLowerCase().endsWith('.pdf')) {
+      const pdfData = await pdf(buffer);
+      text = pdfData.text;
+      // Split by page (this is a simplified approach)
+      // In production, you might want more sophisticated page detection
+      pageTexts = pdfData.text.split('\n\n\n').filter(p => p.trim());
+    } else {
+      return NextResponse.json({ error: 'Unsupported file type. Please upload a PDF.' }, { status: 400 });
+    }
+
+    // Generate document ID
+    const documentId = generateDocumentId();
+
+    // Process each page and create chunks
+    const allChunks: Chunk[] = [];
+    let chunkIndex = 0;
+
+    for (let pageNum = 0; pageNum < pageTexts.length; pageNum++) {
+      const pageText = pageTexts[pageNum];
+      const pageChunks = chunkText(pageText, 800, 100);
+
+      for (const chunkContent of pageChunks) {
+        allChunks.push({
+          content: chunkContent,
+          page_number: pageNum + 1,
+          chunk_index: chunkIndex++,
+          document_id: documentId,
+        });
+      }
+    }
+
+    // Create embeddings for all chunks
+    console.log(`Creating embeddings for ${allChunks.length} chunks...`);
+    
+    const chunksWithEmbeddings = await Promise.all(
+      allChunks.map(async (chunk) => {
+        const embeddingResponse = await openai.embeddings.create({
+          model: 'text-embedding-3-small',
+          input: chunk.content,
+        });
+        
+        return {
+          ...chunk,
+          embedding: embeddingResponse.data[0].embedding,
+        };
+      })
+    );
+
+    // Store document metadata
+    const { data: docData, error: docError } = await supabase
+      .from('documents')
+      .insert({
+        id: documentId,
+        filename: file.name,
+        total_pages: pageTexts.length,
+        total_chunks: allChunks.length,
+      })
+      .select()
+      .single();
+
+    if (docError) {
+      console.error('Error storing document:', docError);
+      return NextResponse.json({ error: 'Failed to store document' }, { status: 500 });
+    }
+
+    // Store chunks with embeddings
+    const { error: chunksError } = await supabase
+      .from('chunks')
+      .insert(
+        chunksWithEmbeddings.map(chunk => ({
+          document_id: chunk.document_id,
+          content: chunk.content,
+          page_number: chunk.page_number,
+          chunk_index: chunk.chunk_index,
+          embedding: chunk.embedding,
+        }))
+      );
+
+    if (chunksError) {
+      console.error('Error storing chunks:', chunksError);
+      return NextResponse.json({ error: 'Failed to store chunks' }, { status: 500 });
+    }
+
+    return NextResponse.json({
+      success: true,
+      document: docData,
+      message: `Successfully processed ${file.name} with ${allChunks.length} chunks`,
+    });
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    return NextResponse.json(
+      { error: 'Failed to process file' },
+      { status: 500 }
+    );
+  }
+}
+```
+
+## 8. Ask API Route (app/api/ask/route.ts)
+```typescript
+import { NextRequest, NextResponse } from 'next/server';
+import { supabase } from '@/lib/supabase';
+import { openai } from '@/lib/openai';
+import type { Citation } from '@/types';
+
+export async function POST(request: NextRequest) {
+  try {
+    const { question, documentId } = await request.json();
+
+    if (!question) {
+      return NextResponse.json({ error: 'No question provided' }, { status: 400 });
+    }
+
+    // Create embedding for the question
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: question,
+    });
+
+    const questionEmbedding = embeddingResponse.data[0].embedding;
+
+    // Search for relevant chunks
+    const { data: chunks, error: searchError } = await supabase
+      .rpc('search_chunks', {
+        query_embedding: questionEmbedding,
+        match_count: 5,
+        filter_document_id: documentId || null,
+      });
+
+    if (searchError) {
+      console.error('Search error:', searchError);
+      return NextResponse.json({ error: 'Failed to search chunks' }, { status: 500 });
+    }
+
+    if (!chunks || chunks.length === 0) {
+      return NextResponse.json({
+        answer: "I couldn't find any relevant information to answer your question.",
+        citations: [],
+      });
+    }
+
+    // Prepare context from chunks
+    const context = chunks
+      .map((chunk, i) => `[Page ${chunk.page_number}]: ${chunk.content}`)
+      .join('\n\n');
+
+    // Generate answer using GPT-4
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a helpful assistant that answers questions based on the provided context from a document. 
+Always cite the page numbers when referencing information. If the context doesn't contain enough information to answer the question, say so.
+Format your citations as [Page X] inline with your answer.`,
+        },
+        {
+          role: 'user',
+          content: `Context from the document:\n\n${context}\n\nQuestion: ${question}`,
+        },
+      ],
+      temperature: 0.7,
+      max_tokens: 1000,
+    });
+
+    const answer = completion.choices[0].message.content || 'Unable to generate an answer.';
+
+    // Extract citations from chunks
+    const citations: Citation[] = chunks.map(chunk => ({
+      page: chunk.page_number,
+      text: chunk.content.substring(0, 150) + '...',
+    }));
+
+    return NextResponse.json({
+      answer,
+      citations,
+    });
+
+  } catch (error) {
+    console.error('Ask error:', error);
+    return NextResponse.json(
+      { error: 'Failed to process question' },
+      { status: 500 }
+    );
+  }
+}
+```
+
+## 9. Main Page Component (app/page.tsx)
+```typescript
+'use client';
+
+import { useState, useCallback } from 'react';
+import { useDropzone } from 'react-dropzone';
+import ReactMarkdown from 'react-markdown';
+import type { ChatMessage, Document } from '@/types';
+
+export default function Home() {
+  const [document, setDocument] = useState<Document | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+
+  // File upload handler
+  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    const file = acceptedFiles[0];
+    if (!file) return;
+
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        setDocument(data.document);
+        setMessages([{
+          role: 'assistant',
+          content: `Successfully uploaded "${data.document.filename}". You can now ask questions about the content!`,
+        }]);
+      } else {
+        alert(`Upload failed: ${data.error}`);
+      }
+    } catch (error) {
+      alert('Upload failed. Please try again.');
+    } finally {
+      setIsUploading(false);
+    }
+  }, []);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'application/pdf': ['.pdf'],
+    },
+    maxFiles: 1,
+  });
+
+  // Chat handler
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || !document) return;
+
+    const userMessage: ChatMessage = { role: 'user', content: input };
+    setMessages(prev => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('/api/ask', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          question: input,
+          documentId: document.id,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        const assistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: data.answer,
+          citations: data.citations,
+        };
+        setMessages(prev => [...prev, assistantMessage]);
+      } else {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `Error: ${data.error}`,
+        }]);
+      }
+    } catch (error) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'Failed to get an answer. Please try again.',
+      }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 p-4">
+      <div className="max-w-4xl mx-auto">
+        <h1 className="text-4xl font-bold text-gray-800 text-center mb-8">
+          BookTalk
+        </h1>
+
+        {!document && (
+          <div
+            {...getRootProps()}
+            className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition-colors ${
+              isDragActive ? 'border-blue-500 bg-blue-50' : 'border-gray-300 bg-white hover:border-gray-400'
+            }`}
+          >
+            <input {...getInputProps()} />
+            {isUploading ? (
+              <div>
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
+                <p className="mt-4 text-gray-600">Processing your document...</p>
+              </div>
+            ) : (
+              <>
+                <svg className="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                  <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <p className="mt-4 text-lg text-gray-600">
+                  {isDragActive ? 'Drop your PDF here' : 'Drag & drop a PDF here, or click to select'}
+                </p>
+              </>
+            )}
+          </div>
+        )}
+
+        {document && (
+          <div className="bg-white rounded-lg shadow-lg">
+            <div className="p-4 border-b">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="font-semibold text-gray-800">{document.filename}</h2>
+                  <p className="text-sm text-gray-500">
+                    {document.total_pages} pages • {document.total_chunks} chunks
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    setDocument(null);
+                    setMessages([]);
+                  }}
+                  className="text-sm text-red-600 hover:text-red-800"
+                >
+                  Upload New Document
+                </button>
+              </div>
+            </div>
+
+            <div className="h-96 overflow-y-auto p-4 space-y-4">
+              {messages.map((message, index) => (
+                <div
+                  key={index}
+                  className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div
+                    className={`max-w-xl rounded-lg p-4 ${
+                      message.role === 'user'
+                        ? 'bg-blue-500 text-white'
+                        : 'bg-gray-200 text-gray-800'
+                    }`}
+                  >
+                    <ReactMarkdown className="prose prose-sm max-w-none">
+                      {message.content}
+                    </ReactMarkdown>
+                    
+                    {message.citations && message.citations.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-gray-300">
+                        <p className="text-xs font-semibold mb-1">Sources:</p>
+                        {message.citations.map((citation, i) => (
+                          <div key={i} className="text-xs mt-1">
+                            <span className="font-medium">Page {citation.page}:</span> {citation.text}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {isLoading && (
+                <div className="flex justify-start">
+                  <div className="bg-gray-200 rounded-lg p-4">
+                    <div className="animate-pulse flex space-x-2">
+                      <div className="rounded-full bg-gray-400 h-2 w-2"></div>
+                      <div className="rounded-full bg-gray-400 h-2 w-2"></div>
+                      <div className="rounded-full bg-gray-400 h-2 w-2"></div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-4 border-t">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder="Ask a question about the document..."
+                  className="flex-1 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  disabled={isLoading}
+                />
+                <button
+                  type="submit"
+                  disabled={isLoading || !input.trim()}
+                  className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Send
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+## 10. Layout Component (app/layout.tsx)
+```typescript
+import type { Metadata } from 'next';
+import { Inter } from 'next/font/google';
+import './globals.css';
+
+const inter = Inter({ subsets: ['latin'] });
+
+export const metadata: Metadata = {
+  title: 'BookTalk - Chat with your PDFs',
+  description: 'Upload PDFs and chat with their content using AI',
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body className={inter.className}>{children}</body>
+    </html>
+  );
+}
+```
+
+## 11. Global Styles (app/globals.css)
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+```
+
+## 12. Tailwind Config (tailwind.config.ts)
+```typescript
+import type { Config } from 'tailwindcss';
+
+const config: Config = {
+  content: [
+    './pages/**/*.{js,ts,jsx,tsx,mdx}',
+    './components/**/*.{js,ts,jsx,tsx,mdx}',
+    './app/**/*.{js,ts,jsx,tsx,mdx}',
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+
+export default config;
+```
+
+## 13. Next.js Config (next.config.mjs)
+```javascript
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  webpack: (config) => {
+    config.resolve.alias.canvas = false;
+    return config;
+  },
+};
+
+export default nextConfig;
+```
+
+## 14. TypeScript Config (tsconfig.json)
+```json
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+```
+
+## 15. README.md
+```markdown
+# BookTalk - Chat with your PDFs
+
+A Next.js application that allows users to upload PDF documents and chat with their content using AI-powered retrieval-augmented generation (RAG).
+
+## Features
+
+- 📄 PDF upload with drag-and-drop interface
+- 💬 Chat interface for asking questions about uploaded documents
+- 🔍 Semantic search using OpenAI embeddings
+- 📖 Page-level citations for answers
+- 🎨 Clean, modern UI with Tailwind CSS
+
+## Prerequisites
+
+- Node.js 18+ and npm
+- OpenAI API key
+- Supabase account with a project
+
+## Local Setup
+
+1. **Clone the repository and install dependencies:**
+   ```bash
+   cd booktalk
+   npm install
+   ```
+
+2. **Set up environment variables:**
+   - Copy `.env.example` to `.env.local`
+   - Fill in your API keys:
+     ```
+     OPENAI_API_KEY=sk-your-openai-api-key
+     NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+     SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+     ```
+
+3. **Initialize Supabase database:**
+   - Go to your Supabase project SQL editor
+   - Run the SQL schema from `lib/supabase.ts`
+   - This creates the necessary tables and functions
+
+4. **Run the development server:**
+   ```bash
+   npm run dev
+   ```
+
+5. **Open http://localhost:3000**
+
+## Deployment to Vercel
+
+1. **Push your code to GitHub**
+
+2. **Connect to Vercel:**
+   - Go to https://vercel.com
+   - Import your GitHub repository
+   - Configure environment variables in Vercel settings
+
+3. **Deploy:**
+   - Vercel will automatically build and deploy your app
+   - Your app will be available at your Vercel URL
+
+## Usage
+
+1. Upload a PDF document using the drag-and-drop interface
+2. Wait for the document to be processed and indexed
+3. Ask questions about the content in the chat interface
+4. Get AI-generated answers with citations to specific pages
+
+## Architecture
+
+- **Frontend:** Next.js 14 with App Router, TypeScript, Tailwind CSS
+- **Backend:** Next.js API routes
+- **Database:** Supabase PostgreSQL with pgvector extension
+- **AI:** OpenAI for embeddings and chat completions
+- **File Processing:** pdf-parse for PDF text extraction
+
+## API Endpoints
+
+- `POST /api/upload` - Handles PDF upload, text extraction, chunking, and embedding storage
+- `POST /api/ask` - Processes user questions and returns AI-generated answers with citations
+```
+
+## How to Run Locally
+
+1. **Create a new directory and copy all files:**
+   ```bash
+   mkdir booktalk
+   cd booktalk
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   npm install
+   ```
+
+3. **Set up environment variables:**
+   - Copy `.env.example` to `.env.local`
+   - Add your API keys
+
+4. **Initialize Supabase:**
+   - Create a new Supabase project at https://supabase.com
+   - Go to SQL Editor in your Supabase dashboard
+   - Run the SQL schema from the `supabaseSchema` export in `lib/supabase.ts`
+
+5. **Run the development server:**
+   ```bash
+   npm run dev
+   ```
+
+6. **Open http://localhost:3000**
+
+The app is now ready to use! You can upload PDFs and start chatting with their content.
